@@ -22,6 +22,20 @@ use stage0_handoff::{
 };
 use userlib::*;
 use zerocopy::{AsBytes, FromBytes};
+use ringbuf::{ringbuf, ringbuf_entry};
+
+#[allow(dead_code)] // Not all cases are used by all variants
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Trace {
+    None,
+    BlockOutOfOrder(usize),
+    BlockWrite(usize, u32),
+    Cached(usize),
+    OutOfBounds(usize),
+    Writing(usize),
+}
+
+ringbuf!(Trace, 128, Trace::None);
 
 // We shouldn't actually dereference these. The types are not correct.
 // They are just here to allow a mechanism for getting the addresses.
@@ -47,6 +61,8 @@ enum UpdateState {
     Finished,
 }
 
+const FW_CACHE_MAX: usize = 4096_usize;
+
 // Note that we could cache the full stage0 image before flashing it.
 // That would reduce our time window of having a partially written stage0.
 struct ServerImpl<'a> {
@@ -57,6 +73,8 @@ struct ServerImpl<'a> {
     flash: drv_lpc55_flash::Flash<'a>,
     hashcrypt: &'a lpc55_pac::hashcrypt::RegisterBlock,
     syscon: drv_lpc55_syscon_api::Syscon,
+    fw_cache: &'a mut [u8; FW_CACHE_MAX],
+    fw_cache_next_block: Option<usize>,
 }
 
 // TODO: This is the size of the vector table on the LPC55. We should
@@ -94,6 +112,8 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
 
         self.image = Some(image_type);
         self.state = UpdateState::InProgress;
+        self.fw_cache_next_block = None;
+        self.fw_cache.fill(0);
         Ok(())
     }
 
@@ -109,6 +129,8 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
         }
 
         self.state = UpdateState::NoUpdate;
+        self.fw_cache_next_block = None;
+        self.fw_cache.fill(0);
         Ok(())
     }
 
@@ -138,15 +160,21 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
         }
 
         let mut flash_page = [0u8; BLOCK_SIZE_BYTES];
+        block
+            .read_range(0..len, &mut flash_page[..len])
+            .map_err(|_| RequestError::Fail(ClientError::WentAway))?;
+
         let target = self.image.unwrap_lite();
 
         if block_num == HEADER_BLOCK {
             let header_block =
                 self.header_block.get_or_insert([0u8; BLOCK_SIZE_BYTES]);
-            block
-                .read_range(0..len, &mut header_block[..])
-                .map_err(|_| RequestError::Fail(ClientError::WentAway))?;
-            header_block[len..].fill(0);
+            *header_block = flash_page;
+            if target != UpdateTarget::Bootloader {
+                // Hubris A and B images will be invalid do to a zeroed header.
+                // A valid one will be written by finish_image_update().
+                flash_page.fill(0);
+            }
             if let Err(e) = validate_header_block(target, header_block) {
                 self.header_block = None;
                 return Err(e.into());
@@ -163,10 +191,30 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
                 .read_range(0..len, &mut flash_page)
                 .map_err(|_| RequestError::Fail(ClientError::WentAway))?;
 
-            flash_page[len..].fill(0);
+            flash_page[len..].fill(0); // XXX not needed on initialized buf
         }
 
-        do_block_write(&mut self.flash, target, block_num, &flash_page)?;
+        // Cache bootloader blocks for image validation before any flashing.
+        if target == UpdateTarget::Bootloader {
+            let begin = block_num * BLOCK_SIZE_BYTES;
+            let end = begin + BLOCK_SIZE_BYTES;
+            if end > self.fw_cache.len() {
+                ringbuf_entry!(Trace::OutOfBounds(end));
+                return Err(UpdateError::OutOfBounds.into());
+            }
+            // Check that bootloader blocks are delivered in order.
+            let next = self.fw_cache_next_block.get_or_insert(0);
+            if block_num != *next {
+                ringbuf_entry!(Trace::BlockOutOfOrder(block_num));
+                return Err(UpdateError::BlockOutOfOrder.into());
+            }
+            *next += 1;
+            self.fw_cache[begin..end].copy_from_slice(&flash_page[..]);
+            ringbuf_entry!(Trace::Cached(block_num));
+        } else {
+            ringbuf_entry!(Trace::Writing(block_num));
+            do_block_write(&mut self.flash, target, block_num, &flash_page)?;
+        }
 
         Ok(())
     }
@@ -189,12 +237,51 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
             return Err(UpdateError::MissingHeaderBlock.into());
         }
 
-        do_block_write(
-            &mut self.flash,
-            self.image.unwrap_lite(),
-            HEADER_BLOCK,
-            self.header_block.as_ref().unwrap_lite(),
-        )?;
+        // If writing the boot loader, nothing has been written yet.
+        // Check the entire image.
+        // There is no redundancy in the boot loader.
+        //
+        // TODO: Should we skip writing blocks that match existing
+        // flash contents?
+        if let Some(image) = Some(UpdateTarget::Bootloader) {
+            if let Some(end) = self.fw_cache_next_block {
+                let len = end * BLOCK_SIZE_BYTES;
+                let bootloader = &self.fw_cache[0..len];
+                // the header has already been sanity checked.
+                // TODO: Validate signature
+
+                for (n, c) in bootloader
+                    .chunks(BYTES_PER_FLASH_PAGE).enumerate() {
+                    ringbuf_entry!(Trace::BlockWrite(n,
+                            u32::from_be_bytes(
+                                c[..4].try_into().unwrap_lite()
+                                )
+                            )
+                        );
+
+
+                    // Test this before obliterating the boot loader
+                    do_block_write(
+                        &mut self.flash,
+                        image,
+                        n,
+                        c.try_into().unwrap_lite(),
+                        )?;
+                    //
+                }
+                // Write all blocks
+            } else {
+                // Bootloader is always cached.
+                unreachable!();
+            }
+        } else {
+            do_block_write(
+                &mut self.flash,
+                self.image.unwrap_lite(),
+                HEADER_BLOCK,
+                self.header_block.as_ref().unwrap_lite(),
+            )?;
+        }
 
         self.state = UpdateState::Finished;
         self.image = None;
@@ -326,7 +413,7 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
                 // Read current CFPA contents.
                 let mut cfpa = [[0u32; 4]; 512 / 16];
                 indirect_flash_read_words(
-                    &mut self.flash,
+                    &self.flash,
                     cfpa_word_number,
                     &mut cfpa,
                 )?;
@@ -403,7 +490,7 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
                 do_raw_page_write(
                     &mut self.flash,
                     CFPA_SCRATCH_FLASH_WORD / 32,
-                    &cfpa_bytes,
+                    cfpa_bytes,
                 )?;
             }
         }
@@ -434,12 +521,12 @@ impl ServerImpl<'_> {
         let mut pong_header = [0u32; 4];
 
         indirect_flash_read_words(
-            &mut self.flash,
+            &self.flash,
             CFPA_PING_FLASH_WORD,
             core::slice::from_mut(&mut ping_header),
         )?;
         indirect_flash_read_words(
-            &mut self.flash,
+            &self.flash,
             CFPA_PONG_FLASH_WORD,
             core::slice::from_mut(&mut pong_header),
         )?;
@@ -466,7 +553,7 @@ impl ServerImpl<'_> {
             cfpa_word_number + BOOT_PREFERENCE_FLASH_WORD_OFFSET;
         let mut boot_selection_word = [0u32; 4];
         indirect_flash_read_words(
-            &mut self.flash,
+            &self.flash,
             boot_selection_word_number,
             core::slice::from_mut(&mut boot_selection_word),
         )?;
@@ -478,7 +565,7 @@ impl ServerImpl<'_> {
         // Read the scratch boot version
         let mut scratch_header = [0u32; 4];
         indirect_flash_read_words(
-            &mut self.flash,
+            &self.flash,
             CFPA_SCRATCH_FLASH_WORD,
             core::slice::from_mut(&mut scratch_header),
         )?;
@@ -492,7 +579,7 @@ impl ServerImpl<'_> {
                     CFPA_SCRATCH_FLASH_WORD + BOOT_PREFERENCE_FLASH_WORD_OFFSET;
                 let mut scratch_boot_selection_word = [0u32; 4];
                 indirect_flash_read_words(
-                    &mut self.flash,
+                    &self.flash,
                     scratch_boot_selection_word_number,
                     core::slice::from_mut(&mut scratch_boot_selection_word),
                 )?;
@@ -603,7 +690,7 @@ fn indirect_flash_read(
     mut addr: u32,
     mut output: &mut [u8],
 ) -> Result<(), UpdateError> {
-    while output.len() > 0 {
+    while !output.is_empty() {
         // Convert from memory (byte) address to word address, per comments in
         // `lpc55_flash` driver.
         let word = (addr / 16) & ((1 << 18) - 1);
@@ -873,7 +960,7 @@ fn caboose_slice(
     )
     .map_err(|_| RawCabooseError::ReadFailed)?;
     if header.magic != HEADER_MAGIC {
-        return Err(RawCabooseError::NoImageHeader.into());
+        return Err(RawCabooseError::NoImageHeader);
     }
 
     // Calculate where the image header implies that the image should end
@@ -885,7 +972,7 @@ fn caboose_slice(
     //
     // SAFETY: populated by the linker, so this should be valid
     if image_end > image_region_end {
-        return Err(RawCabooseError::MissingCaboose.into());
+        return Err(RawCabooseError::MissingCaboose);
     }
 
     // By construction, the last word of the caboose is its size as a `u32`
@@ -898,7 +985,7 @@ fn caboose_slice(
         // This branch will be encountered if there's no caboose, because
         // then the nominal caboose size will be 0xFFFFFFFF, which will send
         // us out of the bank2 region.
-        return Err(RawCabooseError::MissingCaboose.into());
+        return Err(RawCabooseError::MissingCaboose);
     } else {
         // SAFETY: we know this pointer is within the programmed flash region,
         // since it's checked above.
@@ -908,7 +995,7 @@ fn caboose_slice(
         if v == CABOOSE_MAGIC {
             caboose_start + 4..image_end - 4
         } else {
-            return Err(RawCabooseError::MissingCaboose.into());
+            return Err(RawCabooseError::MissingCaboose);
         }
     };
     Ok(caboose_range)
@@ -951,6 +1038,9 @@ fn main() -> ! {
 
     // Go ahead and put the HASHCRYPT unit into reset.
     syscon.enter_reset(drv_lpc55_syscon_api::Peripheral::HashAes);
+    let fw_cache = mutable_statics::mutable_statics! {
+        static mut FW_CACHE: [u8; FW_CACHE_MAX] = [|| 0; _];
+    };
     let mut server = ServerImpl {
         header_block: None,
         state: UpdateState::NoUpdate,
@@ -961,6 +1051,8 @@ fn main() -> ! {
         }),
         hashcrypt: unsafe { &*lpc55_pac::HASHCRYPT::ptr() },
         syscon,
+        fw_cache,
+        fw_cache_next_block: None,
     };
     let mut incoming = [0u8; idl::INCOMING_SIZE];
 
