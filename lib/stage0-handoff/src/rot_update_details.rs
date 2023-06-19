@@ -25,6 +25,12 @@ pub struct RotBootState {
     pub active: RotSlot,
     pub a: Option<RotImageDetails>,
     pub b: Option<RotImageDetails>,
+    pub bootloader: Option<RotImageDetails>,
+    pub staged_bootloader: Option<RotImageDetails>,
+    pub a_signature_valid: bool,
+    pub b_signature_valid: bool,
+    pub bootloader_signature_valid: bool,
+    pub staged_bootloader_signature_valid: bool,
 }
 
 impl RotBootState {
@@ -32,6 +38,7 @@ impl RotBootState {
         match self.active {
             RotSlot::A => self.a.clone(),
             RotSlot::B => self.b.clone(),
+            _ => unreachable!(),
         }
     }
 }
@@ -60,4 +67,6 @@ pub struct ImageVersion {
 pub enum RotSlot {
     A = 0,
     B = 1,
+    Boot = 2,
+    Stage = 3,
 }

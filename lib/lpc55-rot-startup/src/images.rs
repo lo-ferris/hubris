@@ -32,9 +32,36 @@ pub fn get_image_a() -> Option<Image> {
     }
 }
 
+pub fn get_image_boot() -> Option<Image> {
+    let imageboot = unsafe { &__IMAGE_BOOT_BASE };
+
+    let img = Image(imageboot);
+
+    if img.validate() {
+        Some(img)
+    } else {
+        None
+    }
+}
+
+pub fn get_image_stage() -> Option<Image> {
+    let imagestage = unsafe { &__IMAGE_STAGE_BASE };
+
+    let img = Image(imagestage);
+
+    // XXX Does this do the address check properly for an image not sitting at it's execution address?
+    if img.validate() {
+        Some(img)
+    } else {
+        None
+    }
+}
+
 extern "C" {
     static __IMAGE_A_BASE: abi::ImageVectors;
     static __IMAGE_B_BASE: abi::ImageVectors;
+    static __IMAGE_BOOT_BASE: abi::ImageVectors;
+    static __IMAGE_STAGE_BASE: abi::ImageVectors;
     // __vector size is currently defined in the linker script as
     //
     // __vector_size = SIZEOF(.vector_table);
@@ -127,7 +154,7 @@ impl Image {
         // The MPU requires 32 byte alignment and so the compiler pads the
         // image accordingly. The length field from the image header does not
         // (and should not) account for this padding so we must do that here.
-        let img_size = self.get_img_size().unwrap_lite() + 31 & !31;
+        let img_size = (self.get_img_size().unwrap_lite() + 31) & !31;
         let image = unsafe { core::slice::from_raw_parts(img_ptr, img_size) };
 
         let mut img_hash = Sha3_256::new();
@@ -151,7 +178,7 @@ impl Image {
         // The MPU requires 32 byte alignment and so the compiler pads the
         // image accordingly. The length field from the image header does not
         // (and should not) account for this padding so we must do that here.
-        let img_size = self.get_img_size().unwrap_lite() + 31 & !31;
+        let img_size = (self.get_img_size().unwrap_lite() + 31) & !31;
 
         // Safety: this is unsafe because the pointer addition could overflow.
         // If that happens, we'll produce an empty range or crash with a panic.

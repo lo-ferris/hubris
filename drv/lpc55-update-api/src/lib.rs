@@ -67,10 +67,19 @@ pub struct RotBootInfo {
     ///
     /// This is a magic ram value that is cleared by bootleby
     pub transient_boot_preference: Option<SlotId>,
-    /// Sha3-256 Digest of Slot A in Flash      
+    /// Sha3-256 Digest of Slot A in Flash
     pub slot_a_sha3_256_digest: Option<[u8; 32]>,
-    /// Sha3-256 Digest of Slot B in Flash      
+    /// Sha3-256 Digest of Slot B in Flash
     pub slot_b_sha3_256_digest: Option<[u8; 32]>,
+    /// Sha3-256 Digest of Bootloader in Flash
+    pub bootloader_sha3_256_digest: Option<[u8; 32]>,
+    /// Sha3-256 Digest of Staged Bootloader in Flash
+    pub staged_bootloader_sha3_256_digest: Option<[u8; 32]>,
+    /// If readable, the result of checking an image using the ROM code.
+    pub slot_a_signature_valid: bool,
+    pub slot_b_signature_valid: bool,
+    pub bootloader_signature_valid: bool,
+    pub staged_bootloader_signature_valid: bool,
 }
 
 /// Target for an update operation
@@ -80,7 +89,7 @@ pub struct RotBootInfo {
 ///
 /// In particular, the order of variants cannot change!
 #[derive(
-    Eq, PartialEq, Clone, Copy, Serialize, Deserialize, SerializedSize,
+    Eq, PartialEq, Clone, Copy, Serialize, Deserialize, SerializedSize, Debug,
 )]
 pub enum UpdateTarget {
     // This variant was previously used for Alternate, when this enum was shared
@@ -114,6 +123,8 @@ pub enum UpdateTarget {
 pub enum SlotId {
     A,
     B,
+    Boot,
+    Stage,
 }
 
 impl From<RotSlot> for SlotId {
@@ -121,6 +132,8 @@ impl From<RotSlot> for SlotId {
         match value {
             RotSlot::A => SlotId::A,
             RotSlot::B => SlotId::B,
+            RotSlot::Boot => SlotId::Boot,
+            RotSlot::Stage => SlotId::Stage,
         }
     }
 }

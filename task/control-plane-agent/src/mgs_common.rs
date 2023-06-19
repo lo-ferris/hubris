@@ -10,8 +10,8 @@ use drv_sprot_api::{
 };
 use drv_stm32h7_update_api::Update;
 use gateway_messages::{
-    DiscoverResponse, PowerState, RotError, RotSlotId, RotStateV2, SpComponent,
-    SpError, SpPort, SpStateV2,
+    DiscoverResponse, PowerState, RotError, RotSlotId, RotStateV3, SpComponent,
+    SpError, SpPort, SpStateV3,
 };
 use ringbuf::ringbuf_entry_root as ringbuf_entry;
 use static_assertions::const_assert;
@@ -71,7 +71,7 @@ impl MgsCommon {
     pub(crate) fn sp_state(
         &mut self,
         power_state: PowerState,
-    ) -> Result<SpStateV2, SpError> {
+    ) -> Result<SpStateV3, SpError> {
         // SpState has extra-wide fields for the serial and model number. Below
         // when we fill them in we use `usize::min` to pick the right length
         // regardless of which is longer, but really we want to know we aren't
@@ -85,7 +85,7 @@ impl MgsCommon {
 
         let id = self.identity();
 
-        let mut state = SpStateV2 {
+        let mut state = SpStateV3 {
             serial_number: [0; SP_STATE_FIELD_WIDTH],
             model: [0; SP_STATE_FIELD_WIDTH],
             revision: id.revision,
@@ -283,6 +283,7 @@ impl MgsCommon {
                 let slot = match state.active {
                     drv_sprot_api::RotSlot::A => 0,
                     drv_sprot_api::RotSlot::B => 1,
+                    _ => return Err(SpError::InvalidSlotIdForOperation),
                 };
                 Ok(slot)
             }
@@ -323,12 +324,14 @@ impl MgsCommon {
 }
 
 // conversion between gateway_messages types and hubris types is quite tedious.
-fn rot_state(sprot: &SpRot) -> Result<RotStateV2, RotError> {
+fn rot_state(sprot: &SpRot) -> Result<RotStateV3, RotError> {
     let boot_info = sprot.rot_boot_info()?;
 
     let convert_slot_id = |s| match s {
         drv_lpc55_update_api::SlotId::A => RotSlotId::A,
         drv_lpc55_update_api::SlotId::B => RotSlotId::B,
+        // XXX _ => return Err(mgs_common::RotError(Update(current_id: 0))),
+        _ => unreachable!(),
     };
 
     let active = convert_slot_id(boot_info.active);
@@ -340,12 +343,18 @@ fn rot_state(sprot: &SpRot) -> Result<RotStateV2, RotError> {
     let transient_boot_preference =
         boot_info.transient_boot_preference.map(convert_slot_id);
 
-    Ok(RotStateV2 {
+    Ok(RotStateV3 {
         active,
         persistent_boot_preference,
         pending_persistent_boot_preference,
         transient_boot_preference,
         slot_a_sha3_256_digest: boot_info.slot_a_sha3_256_digest,
         slot_b_sha3_256_digest: boot_info.slot_b_sha3_256_digest,
+        bootloader_sha3_256_digest: None,
+        staged_bootloader_sha3_256_digest: None,
+        slot_a_signature_good: None,
+        slot_b_signature_good: None,
+        boot_loader_signature_good: None,
+        staged_boot_loader_signature_good: None,
     })
 }

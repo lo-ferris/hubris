@@ -29,8 +29,11 @@ extern "C" {
     static __IMAGE_B_BASE: ();
     static __IMAGE_B_END: ();
 
-    static __IMAGE_STAGE0_BASE: ();
-    static __IMAGE_STAGE0_END: ();
+    static __IMAGE_BOOT_BASE: ();
+    static __IMAGE_BOOT_END: ();
+
+    static __IMAGE_STAGE_BASE: ();
+    static __IMAGE_STAGE_END: ();
 
     // This references the base of the currently running image
     static __this_image: ();
@@ -66,15 +69,26 @@ macro_rules! image_b_end {
     };
 }
 
-macro_rules! image_stage0_base {
+macro_rules! image_boot_base {
     () => {
-        core::ptr::addr_of!(__IMAGE_STAGE0_BASE) as u32
+        core::ptr::addr_of!(__IMAGE_BOOT_BASE) as u32
     };
 }
 
-macro_rules! image_stage0_end {
+macro_rules! image_boot_end {
     () => {
-        core::ptr::addr_of!(__IMAGE_STAGE0_END) as u32
+        core::ptr::addr_of!(__IMAGE_BOOT_END) as u32
+    };
+
+macro_rules! image_stage_base {
+    () => {
+        core::ptr::addr_of!(__IMAGE_STAGE_BASE) as u32
+    };
+}
+
+macro_rules! image_stage_end {
+    () => {
+        core::ptr::addr_of!(__IMAGE_STAGE_END) as u32
     };
 }
 
@@ -82,7 +96,8 @@ fn get_base(which: UpdateTarget) -> u32 {
     match which {
         UpdateTarget::ImageA => unsafe { image_a_base!() },
         UpdateTarget::ImageB => unsafe { image_b_base!() },
-        UpdateTarget::Bootloader => unsafe { image_stage0_base!() },
+        UpdateTarget::Bootloader => unsafe { image_boot_base!() },
+        UpdateTarget::Stage => unsafe { image_stage_base!() },
         _ => unreachable!(),
     }
 }
@@ -91,7 +106,8 @@ fn get_end(which: UpdateTarget) -> u32 {
     match which {
         UpdateTarget::ImageA => unsafe { image_a_end!() },
         UpdateTarget::ImageB => unsafe { image_b_end!() },
-        UpdateTarget::Bootloader => unsafe { image_stage0_end!() },
+        UpdateTarget::Bootloader => unsafe { image_boot_end!() },
+        UpdateTarget::Stage => unsafe { image_stage_end!() },
         _ => unreachable!(),
     }
 }

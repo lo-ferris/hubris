@@ -33,6 +33,13 @@ enum Trace {
     Cached(usize),
     OutOfBounds(usize),
     Writing(usize),
+    Prep(UpdateState, UpdateTarget),
+    Abort(UpdateState),
+    UpdateNotStarted,
+    UpdateAlreadyFinished,
+    Finish(UpdateState),
+    MissingHeaderBlock(UpdateState),
+    FinishingBootloader(usize),
 }
 
 ringbuf!(Trace, 128, Trace::None);
@@ -42,10 +49,12 @@ ringbuf!(Trace, 128, Trace::None);
 extern "C" {
     static __IMAGE_A_BASE: [u32; 0];
     static __IMAGE_B_BASE: [u32; 0];
-    static __IMAGE_STAGE0_BASE: [u32; 0];
+    static __IMAGE_BOOT_BASE: [u32; 0];
+    static __IMAGE_STAGE_BASE: [u32; 0];
     static __IMAGE_A_END: [u32; 0];
     static __IMAGE_B_END: [u32; 0];
-    static __IMAGE_STAGE0_END: [u32; 0];
+    static __IMAGE_BOOT_END: [u32; 0];
+    static __IMAGE_STAGE_END: [u32; 0];
 
     static __this_image: [u32; 0];
 }
@@ -54,7 +63,7 @@ extern "C" {
 #[link_section = ".bootstate"]
 static BOOTSTATE: MaybeUninit<[u8; 0x1000]> = MaybeUninit::uninit();
 
-#[derive(PartialEq)]
+#[derive(PartialEq,Copy,Clone,Debug)]
 enum UpdateState {
     NoUpdate,
     InProgress,
@@ -100,6 +109,7 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
     ) -> Result<(), RequestError<UpdateError>> {
         // The LPC55 doesn't have an easily accessible mass erase mechanism
         // so this is just bookkeeping
+        ringbuf_entry!(Trace::Prep(self.state, image_type));
         match self.state {
             UpdateState::InProgress => {
                 return Err(UpdateError::UpdateInProgress.into())
@@ -121,6 +131,7 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
         &mut self,
         _: &RecvMessage,
     ) -> Result<(), RequestError<UpdateError>> {
+        ringbuf_entry!(Trace::Abort(self.state));
         match self.state {
             UpdateState::Finished => {
                 return Err(UpdateError::UpdateAlreadyFinished.into())
@@ -142,9 +153,11 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
     ) -> Result<(), RequestError<UpdateError>> {
         match self.state {
             UpdateState::NoUpdate => {
+                ringbuf_entry!(Trace::UpdateNotStarted);
                 return Err(UpdateError::UpdateNotStarted.into())
             }
             UpdateState::Finished => {
+                ringbuf_entry!(Trace::UpdateAlreadyFinished);
                 return Err(UpdateError::UpdateAlreadyFinished.into())
             }
             UpdateState::InProgress => (),
@@ -223,6 +236,7 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
         &mut self,
         _: &RecvMessage,
     ) -> Result<(), RequestError<UpdateError>> {
+        ringbuf_entry!(Trace::Finish(self.state));
         match self.state {
             UpdateState::NoUpdate => {
                 return Err(UpdateError::UpdateNotStarted.into())
@@ -234,6 +248,7 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
         }
 
         if self.header_block.is_none() {
+            ringbuf_entry!(Trace::MissingHeaderBlock(self.state));
             return Err(UpdateError::MissingHeaderBlock.into());
         }
 
@@ -245,6 +260,7 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
         // flash contents?
         if let Some(image) = Some(UpdateTarget::Bootloader) {
             if let Some(end) = self.fw_cache_next_block {
+                ringbuf_entry!(Trace::FinishingBootloader(end));
                 let len = end * BLOCK_SIZE_BYTES;
                 let bootloader = &self.fw_cache[0..len];
                 // the header has already been sanity checked.
@@ -258,7 +274,6 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
                                 )
                             )
                         );
-
 
                     // Test this before obliterating the boot loader
                     do_block_write(
@@ -337,6 +352,12 @@ impl idl::InOrderUpdateImpl for ServerImpl<'_> {
             transient_boot_preference,
             slot_a_sha3_256_digest: boot_state.a.map(|details| details.digest),
             slot_b_sha3_256_digest: boot_state.b.map(|details| details.digest),
+            bootloader_sha3_256_digest: boot_state.bootloader.map(|details| details.digest),
+            staged_bootloader_sha3_256_digest: boot_state.staged_bootloader.map(|details| details.digest),
+            slot_a_signature_valid: boot_state.a_signature_valid,
+            slot_b_signature_valid: boot_state.b_signature_valid,
+            bootloader_signature_valid: boot_state.bootloader_signature_valid,
+            staged_bootloader_signature_valid: boot_state.staged_bootloader_signature_valid,
         };
         Ok(info)
     }
@@ -743,17 +764,19 @@ fn validate_header_block(
     ) & ADDRMASK;
     let a_base = unsafe { __IMAGE_A_BASE.as_ptr() } as u32 & ADDRMASK;
     let b_base = unsafe { __IMAGE_B_BASE.as_ptr() } as u32 & ADDRMASK;
-    let stage0_base = unsafe { __IMAGE_STAGE0_BASE.as_ptr() } as u32 & ADDRMASK;
+    let boot_base = unsafe { __IMAGE_BOOT_BASE.as_ptr() } as u32 & ADDRMASK;
+    let _stage_base = unsafe { __IMAGE_STAGE_BASE.as_ptr() } as u32 & ADDRMASK;
     let a_end = unsafe { __IMAGE_A_END.as_ptr() } as u32 & ADDRMASK;
     let b_end = unsafe { __IMAGE_B_END.as_ptr() } as u32 & ADDRMASK;
-    let stage0_end = unsafe { __IMAGE_STAGE0_END.as_ptr() } as u32 & ADDRMASK;
+    let boot_end = unsafe { __IMAGE_BOOT_END.as_ptr() } as u32 & ADDRMASK;
+    let _stage_end = unsafe { __IMAGE_STAGE_END.as_ptr() } as u32 & ADDRMASK;
 
     // Ensure the image is destined for the right target
     let valid = match target {
         UpdateTarget::ImageA => (a_base..a_end).contains(&reset_vector),
         UpdateTarget::ImageB => (b_base..b_end).contains(&reset_vector),
         UpdateTarget::Bootloader => {
-            (stage0_base..stage0_end).contains(&reset_vector)
+            (boot_base..boot_end).contains(&reset_vector)
         }
         UpdateTarget::_Reserved => false,
     };
@@ -881,7 +904,9 @@ fn get_base(which: UpdateTarget) -> u32 {
     (match which {
         UpdateTarget::ImageA => unsafe { __IMAGE_A_BASE.as_ptr() },
         UpdateTarget::ImageB => unsafe { __IMAGE_B_BASE.as_ptr() },
-        UpdateTarget::Bootloader => unsafe { __IMAGE_STAGE0_BASE.as_ptr() },
+        UpdateTarget::Bootloader => unsafe { __IMAGE_BOOT_BASE.as_ptr() },
+        // TODO: Check callers, checking image or getting write address?
+        // UpdateTarget::Stage => unsafe { __IMAGE_STAGE_BASE.as_ptr() },
         UpdateTarget::_Reserved => panic!(),
     }) as u32
 }
@@ -890,7 +915,9 @@ fn get_end(which: UpdateTarget) -> u32 {
     (match which {
         UpdateTarget::ImageA => unsafe { __IMAGE_A_END.as_ptr() },
         UpdateTarget::ImageB => unsafe { __IMAGE_B_END.as_ptr() },
-        UpdateTarget::Bootloader => unsafe { __IMAGE_STAGE0_END.as_ptr() },
+        UpdateTarget::Bootloader => unsafe { __IMAGE_BOOT_END.as_ptr() },
+        // TODO: Check callers, checking image or getting target length?
+        // UpdateTarget::Stage => unsafe { __IMAGE_STAGE_END.as_ptr() },
         UpdateTarget::_Reserved => panic!(),
     }) as u32
 }
@@ -939,6 +966,14 @@ fn caboose_slice(
             SlotId::B => (
                 __IMAGE_B_BASE.as_ptr() as u32,
                 __IMAGE_B_END.as_ptr() as u32,
+            ),
+            SlotId::Boot => (
+                __IMAGE_BOOT_BASE.as_ptr() as u32,
+                __IMAGE_BOOT_END.as_ptr() as u32,
+            ),
+            SlotId::Stage => (
+                __IMAGE_STAGE_BASE.as_ptr() as u32,
+                __IMAGE_STAGE_END.as_ptr() as u32,
             ),
         }
     };

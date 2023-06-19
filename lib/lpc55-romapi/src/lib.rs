@@ -419,6 +419,40 @@ fn bootloader_tree() -> &'static BootloaderTree {
     unsafe { &*(LPC55_ROM_TABLE) }
 }
 
+pub fn auth(image: *const u32) -> bool {
+    let rom_auth = bootloader_tree().skboot.skboot_authenticate;
+    let mut is_verified = 1234; // function doesn't always initialize this
+
+    // Safety: skboot_authenticate is written in C and is part of the NXP ROM,
+    // home of CVEs a'plenty. This function _should_ only
+    //
+    // 1. Read through our pointer, with the bounds determined by header fields
+    //    that we've verified.
+    // 2. Write through the annoying out-parameter `is_verified`.
+    // 3. Mess around with boot ROM scratch space, which isn't part of our RAM
+    //    area so overwriting it has no effect on our program.
+    //
+    // If these properties hold, then calling this is safe. If they don't hold,
+    // our entire secure boot apparatus is likely broken.
+    //
+    // Incidentally: another good reason why this call is unsafe is that the ROM
+    // appears to unmask the HASHCRYPT interrupt. We've provided a HASHCRYPT
+    // handler that redirects into the ROM (below) without doing any
+    // potentially-racy things to our state, so that's ok. We'll disable it in
+    // just a bit.
+    let result = unsafe { rom_auth(image, &mut is_verified) };
+    // I have _no_ reason to believe the ROM re-masks this interrupt, so, let's
+    // do it ourselves.
+    cortex_m::peripheral::NVIC::mask(lpc55_pac::Interrupt::HASHCRYPT);
+
+    // > ...the caller shall verify both return values and consider authentic
+    // > image only when the function returns kStatus_SKBOOT_Success AND
+    // > *isSignVerified == kSECURE_TRACKER_VERIFIED.
+    //      - NXP UM11126 section 7.4.1
+    return result == SkbootStatus::Success as u32
+        && is_verified == SecureBool::TrackerVerified as u32
+}
+
 const LPC55_BOOT_ROM: *const BootRom = 0x0300_0000 as *const BootRom;
 
 #[repr(C)]

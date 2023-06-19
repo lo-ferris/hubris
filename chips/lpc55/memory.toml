@@ -13,11 +13,20 @@ read = true
 execute = true
 
 [[flash]]
-name = "stage0"
+name = "boot"
 address = 0x00000000
-size = 0x10000
+size = 0x08000
 read = true
 execute = true
+
+# Should the bootloader staging area be in the Hubris flash space
+# instead?
+[[flash]]
+name = "stage"
+address = 0x00008000
+size = 0x08000
+read = true
+execute = false
 
 [[flash]]
 name = "dice-mfg"

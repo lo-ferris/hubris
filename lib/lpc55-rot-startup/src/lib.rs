@@ -12,14 +12,18 @@ mod dice_mfg_usart;
 mod images;
 #[cfg(any(feature = "dice-mfg", feature = "dice-self"))]
 use lpc55_puf::Puf;
+pub mod verify;
+use verify::{verify_image, SlotId};
 
 pub mod handoff;
 use handoff::Handoff;
+// use bootleby::{verify_image, SlotId};
 
 use armv8_m_mpu::{disable_mpu, enable_mpu};
 use cortex_m::peripheral::MPU;
 use stage0_handoff::{RotBootState, RotSlot};
 
+// use static_assertions::*;
 const ROM_VER: u32 = 1;
 
 // Setup the MPU so that we can treat the USB RAM as normal RAM, and not as a
@@ -111,6 +115,8 @@ pub fn startup(
     // function to determine which image is running.
     let img_a = images::get_image_a();
     let img_b = images::get_image_b();
+    let img_boot = images::get_image_boot();
+    let img_stage = images::get_image_stage();
     let here = startup as *const u8;
     let active = if img_a.as_ref().map(|i| i.contains(here)).unwrap_or(false) {
         RotSlot::A
@@ -121,8 +127,26 @@ pub fn startup(
     };
     let a = img_a.map(images::image_details);
     let b = img_b.map(images::image_details);
+    let bootloader = img_boot.map(images::image_details);
+    let staged_bootloader = img_stage.map(images::image_details);
+    // Safety XXX
+    let p = unsafe { lpc55_pac::Peripherals::steal() };
+    let a_signature_valid = verify_image(&p.FLASH, SlotId::A).is_some();
+    let b_signature_valid = verify_image(&p.FLASH, SlotId::B).is_some();
+    let bootloader_signature_valid = verify_image(&p.FLASH, SlotId::Bootloader).is_some();
+    let staged_bootloader_signature_valid = verify_image(&p.FLASH, SlotId::StagedBootloader).is_some();
 
-    let details = RotBootState { active, a, b };
+    let details = RotBootState {
+        active,
+        a, b, bootloader, staged_bootloader,
+        a_signature_valid,
+        b_signature_valid,
+        bootloader_signature_valid,
+        staged_bootloader_signature_valid,
+    };
+    // XXX remove this assertion, 184 == 0xb8
+    static_assertions::const_assert!(
+        core::mem::size_of::<RotBootState>() == 184_usize);
 
     handoff.store(&details);
 }
